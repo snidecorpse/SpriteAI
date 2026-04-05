@@ -7,13 +7,14 @@ from typing import Dict, Tuple
 STATE_KEYS: Tuple[str, ...] = ("eating", "feeding", "sleeping", "hygiene")
 
 BASE_STYLE_PROMPT = (
-    "tiny tamagotchi-like pet character, 32x32 pixel art style, clear silhouette, "
-    "retro game sprite, front-facing, minimal shading, readable at tiny scale"
+    "tiny tamagotchi-like pet character, pixel-art game sprite, single character, "
+    "clean silhouette, simple background, front-facing, compact proportions, readable at tiny scale"
 )
 
 NEGATIVE_PROMPT = (
-    "photorealistic, blurry, anti-aliased edges, text, watermark, logo, deformed, "
-    "multiple characters, cluttered background"
+    "photorealistic, realistic skin, realistic eyes, camera photo, room interior, furniture, "
+    "wall, bed, cluttered background, blurry, anti-aliased edges, text, watermark, logo, "
+    "deformed, multiple characters"
 )
 
 STATE_INSTRUCTIONS: Dict[str, str] = {
@@ -41,4 +42,5 @@ def build_state_prompt(state: str, user_prompt: str) -> str:
     if state not in STATE_KEYS:
         raise ValueError(f"Unsupported state '{state}'. Expected one of {STATE_KEYS}.")
     base = build_base_prompt(user_prompt)
-    return f"{base}, {STATE_INSTRUCTIONS[state]}"
+    state_token = f"<state_{state}>"
+    return f"{state_token}, {base}, {STATE_INSTRUCTIONS[state]}"

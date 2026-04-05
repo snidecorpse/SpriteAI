@@ -1,0 +1,27 @@
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test/cache/temp outputs
+.pytest_cache/
+pytest-cache-files-*/
+tests_tmp_check/
+tmp*/
+
+# Local model/data artifacts (large)
+artifacts/
+data/
+spriteai/dataset/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+

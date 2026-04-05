@@ -9,7 +9,8 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from PIL import Image, ImageDraw
+import numpy as np
+from PIL import Image, ImageDraw, ImageEnhance
 
 from .pixelize import pixelize_image
 from .preprocess import preprocess_reference_image
@@ -45,6 +46,19 @@ def _dominant_colors(image: Image.Image, colors: int = 4) -> List[tuple[int, int
     while len(swatches) < colors:
         swatches.append(swatches[-1])
     return swatches[:colors]
+
+
+def _flatten_to_neutral_background(image: Image.Image) -> Image.Image:
+    """Convert RGBA to cleaner RGB by compositing transparency over neutral bg."""
+    rgba = image.convert("RGBA")
+    arr = np.asarray(rgba).astype(np.float32)
+    rgb = arr[:, :, :3]
+    alpha = arr[:, :, 3:4] / 255.0
+
+    bg = np.array([236.0, 236.0, 238.0], dtype=np.float32).reshape(1, 1, 3)
+    merged = rgb * alpha + bg * (1.0 - alpha)
+    out = Image.fromarray(np.clip(merged, 0, 255).astype(np.uint8), mode="RGB")
+    return ImageEnhance.Sharpness(out).enhance(1.12)
 
 
 def _render_base_character(reference: Image.Image, seed: int) -> Image.Image:
@@ -116,6 +130,8 @@ class SpriteGenerationPipeline:
     def __init__(self, model_id: Optional[str] = None, lora_path: Optional[str] = None):
         self.model_id = model_id or os.getenv("SPRITEAI_MODEL_ID", "runwayml/stable-diffusion-v1-5")
         self.lora_path = lora_path or os.getenv("SPRITEAI_LORA_PATH")
+        self.lora_scale = float(os.getenv("SPRITEAI_LORA_SCALE", "1.25"))
+        self.model_input_size = int(os.getenv("SPRITEAI_MODEL_INPUT_SIZE", "384"))
         self.force_fallback = os.getenv("SPRITEAI_FORCE_FALLBACK", "").lower() in {"1", "true", "yes"}
 
         self._pipe = None
@@ -124,6 +140,7 @@ class SpriteGenerationPipeline:
         self._backend_initialized = False
         self._load_warnings: List[str] = []
         self._ip_adapter_loaded = False
+        self._lora_loaded = False
 
     @property
     def backend(self) -> str:
@@ -156,7 +173,11 @@ class SpriteGenerationPipeline:
             pipe.enable_attention_slicing()
 
             if self.lora_path:
-                pipe.load_lora_weights(self.lora_path)
+                try:
+                    pipe.load_lora_weights(self.lora_path)
+                    self._lora_loaded = True
+                except Exception as exc:
+                    self._load_warnings.append(f"Failed to load LoRA from '{self.lora_path}': {exc}")
 
             # Optional image-conditioning adapter when configured.
             ip_repo = os.getenv("SPRITEAI_IP_ADAPTER_REPO")
@@ -199,22 +220,28 @@ class SpriteGenerationPipeline:
 
         torch = self._torch
         device = self._pipe.device.type
-        strength = _clamp(creativity, 0.3, 0.45)
-        base_strength = _clamp(0.45 + creativity * 0.15, 0.45, 0.6)
+        ref_rgb = _flatten_to_neutral_background(preprocessed_ref)
+        creativity = _clamp(creativity, 0.12, 0.45)
+        # Lower strengths preserve identity from reference while still stylizing.
+        # Slightly higher base strength helps "escape photo mode" into sprite style.
+        base_strength = _clamp(0.34 + creativity * 0.24, 0.34, 0.46)
+        state_strength = _clamp(0.1 + creativity * 0.16, 0.1, 0.18)
 
         common = {
             "negative_prompt": NEGATIVE_PROMPT,
-            "guidance_scale": 7.0,
-            "num_inference_steps": 24,
+            "guidance_scale": 8.8,
+            "num_inference_steps": 34,
         }
+        if self._lora_loaded:
+            common["cross_attention_kwargs"] = {"scale": float(self.lora_scale)}
         ip_kwargs = {}
         if self._ip_adapter_loaded:
-            ip_kwargs["ip_adapter_image"] = preprocessed_ref.convert("RGB")
+            ip_kwargs["ip_adapter_image"] = ref_rgb
 
         base_generator = torch.Generator(device=device).manual_seed(seed)
         base_image = self._pipe(
             prompt=build_base_prompt(prompt),
-            image=preprocessed_ref.convert("RGB"),
+            image=ref_rgb,
             strength=base_strength,
             generator=base_generator,
             **common,
@@ -223,11 +250,12 @@ class SpriteGenerationPipeline:
 
         outputs: Dict[str, Image.Image] = {}
         for state in STATE_KEYS:
-            state_generator = torch.Generator(device=device).manual_seed(seed)
+            state_seed = _hash_to_seed(seed, state)
+            state_generator = torch.Generator(device=device).manual_seed(state_seed)
             state_image = self._pipe(
                 prompt=build_state_prompt(state, prompt),
                 image=base_image,
-                strength=strength,
+                strength=state_strength,
                 generator=state_generator,
                 **common,
                 **ip_kwargs,
@@ -255,7 +283,7 @@ class SpriteGenerationPipeline:
         reference_image: Image.Image,
         prompt: str,
         seed: Optional[int] = None,
-        creativity: float = 0.35,
+        creativity: float = 0.22,
     ) -> GenerationResult:
         if not isinstance(reference_image, Image.Image):
             raise ValueError("Expected a valid image input.")
@@ -266,13 +294,34 @@ class SpriteGenerationPipeline:
         if seed is None:
             seed = random.randint(0, 2_147_483_647)
 
-        pre = preprocess_reference_image(reference_image, target_size=256)
+        pre = preprocess_reference_image(reference_image, target_size=self.model_input_size)
         self._ensure_backend()
 
         warnings = list(pre.warnings)
         for warning in self._load_warnings:
             if warning not in warnings:
                 warnings.append(warning)
+
+        if self.backend == "diffusers" and self._torch is not None and not bool(self._torch.cuda.is_available()):
+            msg = (
+                "Diffusers backend is running on CPU. "
+                "Install CUDA-enabled PyTorch to use your NVIDIA GPU."
+            )
+            if msg not in warnings:
+                warnings.append(msg)
+        if self.backend == "fallback" and self.lora_path:
+            msg = (
+                "LoRA path is set but fallback backend is active; LoRA weights are ignored in fallback mode."
+            )
+            if msg not in warnings:
+                warnings.append(msg)
+        if self.backend == "diffusers" and self.lora_path:
+            if self._lora_loaded:
+                msg = f"LoRA loaded from: {self.lora_path} (scale={self.lora_scale:.2f})"
+            else:
+                msg = f"LoRA path configured but not loaded: {self.lora_path}"
+            if msg not in warnings:
+                warnings.append(msg)
 
         if self.backend == "diffusers" and self._pipe is not None:
             images = self._generate_with_diffusers(pre.image, prompt, int(seed), float(creativity))
@@ -302,7 +351,7 @@ def generate_states(
     reference_image: Image.Image,
     prompt: str,
     seed: Optional[int] = None,
-    creativity: float = 0.35,
+    creativity: float = 0.22,
 ) -> Dict[str, Image.Image]:
     """Public inference API that returns exactly 4 state images."""
     result = _get_default_pipeline().generate(
@@ -318,7 +367,7 @@ def generate_states_with_meta(
     reference_image: Image.Image,
     prompt: str,
     seed: Optional[int] = None,
-    creativity: float = 0.35,
+    creativity: float = 0.22,
 ) -> GenerationResult:
     """Extended API with warnings/backend/latency metadata."""
     return _get_default_pipeline().generate(

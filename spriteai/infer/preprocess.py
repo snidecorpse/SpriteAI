@@ -57,6 +57,41 @@ def _pad_to_square(image: Image.Image, fill=(0, 0, 0, 0)) -> Image.Image:
     return out
 
 
+def _center_square_crop(image: Image.Image, crop_ratio: float = 1.0) -> Image.Image:
+    w, h = image.size
+    side = int(min(w, h) * crop_ratio)
+    side = max(1, min(side, min(w, h)))
+    cx = w // 2
+    cy = h // 2
+    x0 = max(0, cx - side // 2)
+    y0 = max(0, cy - side // 2)
+    x1 = min(w, x0 + side)
+    y1 = min(h, y0 + side)
+    return image.crop((x0, y0, x1, y1))
+
+
+def _portrait_focus_crop(
+    image: Image.Image,
+    crop_ratio: float = 0.82,
+    y_bias: float = -0.08,
+) -> Image.Image:
+    """Center crop with slight upward bias for head/torso portraits."""
+    w, h = image.size
+    side = int(min(w, h) * crop_ratio)
+    side = max(1, min(side, min(w, h)))
+    cx = w // 2
+    cy = int(h // 2 + y_bias * side)
+    x0 = max(0, cx - side // 2)
+    y0 = max(0, cy - side // 2)
+    x1 = min(w, x0 + side)
+    y1 = min(h, y0 + side)
+    if x1 - x0 < side:
+        x0 = max(0, x1 - side)
+    if y1 - y0 < side:
+        y0 = max(0, y1 - side)
+    return image.crop((x0, y0, x1, y1))
+
+
 def _blur_score(image: Image.Image) -> float:
     gray = image.convert("L")
     arr = np.asarray(gray, dtype=np.float32)
@@ -95,11 +130,27 @@ def preprocess_reference_image(image: Image.Image, target_size: int = 256) -> Pr
     if not isinstance(image, Image.Image):
         raise ValueError("Input must be a PIL Image.")
 
+    warnings: List[str] = []
     source = image.convert("RGBA")
+    src_w, src_h = source.size
+    aspect = max(src_w, src_h) / max(1, min(src_w, src_h))
+    if aspect > 1.18:
+        source = _portrait_focus_crop(source, crop_ratio=0.84, y_bias=-0.08)
+        warnings.append("Applied portrait-focused crop to reduce background context.")
+
     fg = _simple_background_alpha(source)
     bbox = _bbox_from_alpha(fg)
+    x0, y0, x1, y1 = bbox
+    bbox_area = max(1, (x1 - x0) * (y1 - y0))
+    frame_area = max(1, fg.size[0] * fg.size[1])
+    coverage = bbox_area / frame_area
+    if coverage > 0.9:
+        fg = _portrait_focus_crop(fg, crop_ratio=0.72, y_bias=-0.1)
+        bbox = _bbox_from_alpha(fg)
+        warnings.append("Background separation was weak; applied tighter portrait crop around subject.")
+
     cropped = fg.crop(bbox)
     squared = _pad_to_square(cropped)
     resized = squared.resize((target_size, target_size), Image.Resampling.LANCZOS)
-    warnings = assess_reference_quality(resized)
+    warnings.extend(assess_reference_quality(resized))
     return PreprocessResult(image=resized, warnings=warnings)

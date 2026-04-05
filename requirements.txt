@@ -2,6 +2,7 @@ accelerate>=0.30.0
 diffusers>=0.30.0
 gradio>=4.36.0
 numpy>=1.26.0
+opencv-python-headless>=4.10.0
 peft>=0.11.0
 pillow>=10.3.0
 pytest>=8.2.0

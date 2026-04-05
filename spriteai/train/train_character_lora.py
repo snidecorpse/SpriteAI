@@ -1,4 +1,4 @@
-"""LoRA fine-tuning entrypoint for SpriteAI (SD1.5)."""
+"""Character-only LoRA training entrypoint for SpriteAI (SD1.5)."""
 
 from __future__ import annotations
 
@@ -14,11 +14,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 
 @dataclass(frozen=True)
-class TrainConfig:
+class TrainCharacterConfig:
     dataset_dir: Path
     output_dir: Path
     model_id: str
@@ -31,10 +31,11 @@ class TrainConfig:
     max_train_steps: int
     precision: str
     num_workers: int
+    front_view_weight: float
     seed: int
 
 
-class JsonlSpriteDataset(Dataset):
+class JsonlCharacterDataset(Dataset):
     def __init__(self, dataset_dir: Path, metadata_file: str, resolution: int = 256):
         self.dataset_dir = dataset_dir
         self.records = self._load_jsonl(dataset_dir / metadata_file)
@@ -62,18 +63,17 @@ class JsonlSpriteDataset(Dataset):
         record = self.records[idx]
         image_path = self.dataset_dir / record["image_path"]
         with Image.open(image_path) as img:
-            rgb = img.convert("RGB").resize(
-                (self.resolution, self.resolution),
-                Image.Resampling.LANCZOS,
-            )
+            rgb = img.convert("RGB").resize((self.resolution, self.resolution), Image.Resampling.NEAREST)
         arr = np.asarray(rgb, dtype=np.float32) / 127.5 - 1.0
         tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-        return {"pixel_values": tensor, "prompt": str(record["prompt"])}
+        return {
+            "pixel_values": tensor,
+            "prompt": str(record["prompt"]),
+            "view": str(record.get("view", "")),
+        }
 
 
-class SpriteCollator:
-    """Top-level collator to avoid local-function pickling issues on Windows."""
-
+class CharacterCollator:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
@@ -92,24 +92,38 @@ class SpriteCollator:
         return {"pixel_values": pixel_values, "input_ids": tokenized.input_ids}
 
 
-def _parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train SD1.5 LoRA for SpriteAI.")
+def _build_sample_weights(records: List[Dict[str, str]], front_view_weight: float) -> List[float]:
+    weights: List[float] = []
+    for row in records:
+        view = str(row.get("view", "")).strip().lower()
+        weights.append(float(front_view_weight) if view == "front" else 1.0)
+    return weights
+
+
+def _parse_args() -> TrainCharacterConfig:
+    parser = argparse.ArgumentParser(description="Train character-only SD1.5 LoRA for SpriteAI.")
     parser.add_argument("--dataset_dir", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--model_id", type=str, default="runwayml/stable-diffusion-v1-5")
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--rank", type=int, default=16)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--max_train_steps", type=int, default=0, help="0 means derive from epochs.")
     parser.add_argument("--precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--front_view_weight",
+        type=float,
+        default=2.0,
+        help="Sampling weight multiplier for rows where view=front.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    return TrainConfig(
+    return TrainCharacterConfig(
         dataset_dir=args.dataset_dir,
         output_dir=args.output_dir,
         model_id=args.model_id,
@@ -122,6 +136,7 @@ def _parse_args() -> TrainConfig:
         max_train_steps=args.max_train_steps,
         precision=args.precision,
         num_workers=args.num_workers,
+        front_view_weight=args.front_view_weight,
         seed=args.seed,
     )
 
@@ -161,7 +176,7 @@ def _assert_dependencies() -> None:
         )
 
 
-def train(config: TrainConfig) -> None:
+def train(config: TrainCharacterConfig) -> None:
     _assert_dependencies()
     from accelerate import Accelerator
     from diffusers import (
@@ -215,22 +230,44 @@ def train(config: TrainConfig) -> None:
     unet.add_adapter(lora_config)
     unet.train()
 
-    dataset = JsonlSpriteDataset(config.dataset_dir, "train_metadata.jsonl", resolution=config.resolution)
-    collator = SpriteCollator(tokenizer)
+    dataset = JsonlCharacterDataset(config.dataset_dir, "train_metadata.jsonl", resolution=config.resolution)
+    collator = CharacterCollator(tokenizer)
 
     num_workers = int(config.num_workers)
     if sys.platform.startswith("win") and num_workers > 0:
-        # Windows uses spawn; this is safer and avoids common pickling crashes.
         print(
             "Warning: forcing --num_workers=0 on Windows for training stability. "
             "Re-run on Linux if you want multi-worker dataloading."
         )
         num_workers = 0
 
+    weights = _build_sample_weights(dataset.records, front_view_weight=float(config.front_view_weight))
+    sampler = None
+    shuffle = True
+    if any(w != 1.0 for w in weights):
+        sampler = WeightedRandomSampler(
+            weights=torch.tensor(weights, dtype=torch.double),
+            num_samples=len(weights),
+            replacement=True,
+        )
+        shuffle = False
+        front_count = sum(1 for row in dataset.records if str(row.get("view", "")).lower() == "front")
+        print(
+            json.dumps(
+                {
+                    "sampling": "weighted",
+                    "front_view_weight": float(config.front_view_weight),
+                    "front_rows": int(front_count),
+                    "total_rows": int(len(dataset.records)),
+                }
+            )
+        )
+
     dataloader = DataLoader(
         dataset,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collator,
     )
@@ -268,7 +305,7 @@ def train(config: TrainConfig) -> None:
 
     global_step = 0
     for epoch in range(num_train_epochs):
-        for step, batch in enumerate(dataloader):
+        for _, batch in enumerate(dataloader):
             with accelerator.accumulate(unet):
                 latents = vae.encode(batch["pixel_values"].to(dtype=dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor

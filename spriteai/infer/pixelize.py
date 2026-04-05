@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 from PIL import Image
 
@@ -32,8 +32,9 @@ def _flatten_palette(palette: Palette) -> List[int]:
     values: List[int] = []
     for r, g, b in palette:
         values.extend([int(r), int(g), int(b)])
+    pad = values[-3:] if len(values) >= 3 else [0, 0, 0]
     while len(values) < 768:
-        values.extend([0, 0, 0])
+        values.extend(pad)
     return values[:768]
 
 
